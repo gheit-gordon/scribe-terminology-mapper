@@ -11,13 +11,14 @@ import json
 import unittest
 from pathlib import Path
 
+from src.abbreviations import expand_abbreviations
 from src.context import (
     detect_clinical_context,
     diagnosis_query_for_reason,
     extract_medication_reason,
 )
 from src.pipeline import map_encounter
-from src.ranking import rank_candidates
+from src.ranking import filter_context_compatible_candidates, rank_candidates
 from src.schemas import CodeCandidate, EncounterInput, PhraseInput
 from src.terminology.icd10 import (
     Icd10Client,
@@ -70,7 +71,7 @@ class FakeRxNormClient:
 class SchemaAndFileTests(unittest.TestCase):
     def test_synthetic_file_covers_five_required_scenarios(self) -> None:
         raw = json.loads(ENCOUNTERS_FILE.read_text(encoding="utf-8"))
-        self.assertEqual(len(raw), 5)
+        self.assertEqual(len(raw), 6)
         scenarios = {item["scenario"] for item in raw}
         self.assertEqual(
             scenarios,
@@ -80,6 +81,7 @@ class SchemaAndFileTests(unittest.TestCase):
                 "historical condition",
                 "uncertain diagnosis",
                 "abbreviation",
+                "current abbreviation",
             },
         )
         for item in raw:
@@ -93,6 +95,21 @@ class SchemaAndFileTests(unittest.TestCase):
         self.assertIn("chest x-ray pending", syn004["note"].lower())
         phrases = {item["phrase"] for item in syn004["diagnoses"]}
         self.assertEqual(phrases, {"cough", "fever", "pneumonia"})
+
+        syn005 = next(item for item in raw if item["encounter_id"] == "SYN-005")
+        self.assertEqual(syn005["scenario"], "abbreviation")
+        self.assertEqual(
+            syn005["note"],
+            "SYNTHETIC TEST NOTE: Adult follow-up for UTI. Continues HCTZ. No real patient identifiers are included.",
+        )
+        self.assertEqual([item["phrase"] for item in syn005["diagnoses"]], ["UTI"])
+        self.assertEqual([item["phrase"] for item in syn005["medications"]], ["HCTZ"])
+
+        syn006 = next(item for item in raw if item["encounter_id"] == "SYN-006")
+        self.assertEqual(syn006["scenario"], "current abbreviation")
+        self.assertIn("UTI", syn006["note"])
+        self.assertNotIn("follow-up", syn006["note"].lower())
+        self.assertEqual([item["phrase"] for item in syn006["diagnoses"]], ["UTI"])
 
     def test_mapping_json_uses_null_confidence(self) -> None:
         encounter = EncounterInput(
@@ -511,6 +528,282 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(by_phrase["HCTZ"].suggested_code, "5487")
         self.assertNotIn("hypertension", by_phrase)
         self.assertEqual(len(results), 2)
+
+
+class AbbreviationTests(unittest.TestCase):
+    def test_active_uti_expands_and_searches_urinary_tract_infection(self) -> None:
+        encounter = EncounterInput(
+            encounter_id="SYN-006",
+            note="SYNTHETIC TEST NOTE: Adult presents with UTI.",
+            diagnoses=[PhraseInput(phrase="UTI")],
+        )
+        icd10 = FakeIcd10Client(
+            by_phrase={
+                "urinary tract infection": [
+                    CodeCandidate(
+                        code="N39.0",
+                        description="Urinary tract infection, site not specified",
+                    )
+                ]
+            }
+        )
+        results = map_encounter(
+            encounter,
+            icd10_client=icd10,
+            rxnorm_client=FakeRxNormClient(),
+        )
+        self.assertEqual(icd10.phrases, ["urinary tract infection"])
+        self.assertEqual(results[0].source_phrase, "UTI")
+        self.assertEqual(results[0].source_text, encounter.note)
+        self.assertEqual(results[0].review_status, "needs_review")
+        self.assertEqual(results[0].suggested_code, "N39.0")
+        self.assertEqual(results[0].clinical_context, "current")
+
+    def test_follow_up_uti_does_not_call_icd_api(self) -> None:
+        encounter = EncounterInput(
+            encounter_id="SYN-005",
+            note="SYNTHETIC TEST NOTE: Adult follow-up for UTI. Continues HCTZ.",
+            diagnoses=[PhraseInput(phrase="UTI")],
+            medications=[PhraseInput(phrase="HCTZ")],
+        )
+        icd10 = FakeIcd10Client(
+            candidates=[
+                CodeCandidate(
+                    code="T58.11XA",
+                    description="Toxic effect of carbon monoxide from utility gas",
+                )
+            ]
+        )
+        results = map_encounter(
+            encounter,
+            icd10_client=icd10,
+            rxnorm_client=FakeRxNormClient(
+                candidates=[CodeCandidate(code="5487", description="hydrochlorothiazide")]
+            ),
+        )
+        self.assertEqual(icd10.phrases, [])
+        self.assertNotIn("urinary tract infection", icd10.phrases)
+        self.assertEqual(results[0].source_phrase, "UTI")
+        self.assertEqual(results[0].review_status, "do_not_code")
+        self.assertEqual(results[0].clinical_context, "follow_up")
+        self.assertEqual(results[0].alternatives, [])
+
+    def test_htn_expands_to_hypertension(self) -> None:
+        encounter = EncounterInput(
+            encounter_id="SYN-TEST-HTN",
+            note="SYNTHETIC TEST NOTE: Adult presents with HTN.",
+            diagnoses=[PhraseInput(phrase="HTN")],
+        )
+        icd10 = FakeIcd10Client(
+            by_phrase={
+                "hypertension": [
+                    CodeCandidate(code="I10", description="Essential (primary) hypertension")
+                ]
+            }
+        )
+        results = map_encounter(
+            encounter,
+            icd10_client=icd10,
+            rxnorm_client=FakeRxNormClient(),
+        )
+        self.assertEqual(icd10.phrases, ["hypertension"])
+        self.assertEqual(results[0].source_phrase, "HTN")
+        self.assertEqual(results[0].suggested_code, "I10")
+
+    def test_unknown_abbreviation_remains_unchanged(self) -> None:
+        encounter = EncounterInput(
+            encounter_id="SYN-TEST-XYZ",
+            note="SYNTHETIC TEST NOTE: Adult presents with XYZ.",
+            diagnoses=[PhraseInput(phrase="XYZ")],
+        )
+        icd10 = FakeIcd10Client(
+            candidates=[CodeCandidate(code="R69", description="Illness, unspecified")]
+        )
+        results = map_encounter(
+            encounter,
+            icd10_client=icd10,
+            rxnorm_client=FakeRxNormClient(),
+        )
+        self.assertEqual(icd10.phrases, ["XYZ"])
+        self.assertEqual(results[0].source_phrase, "XYZ")
+
+    def test_does_not_expand_abbreviation_inside_larger_words(self) -> None:
+        self.assertEqual(expand_abbreviations("utility"), "utility")
+        self.assertEqual(expand_abbreviations("mild"), "mild")
+        self.assertEqual(expand_abbreviations("UTI"), "urinary tract infection")
+        self.assertEqual(expand_abbreviations("uti"), "urinary tract infection")
+
+    def test_rxnorm_medication_query_is_passed_through_unchanged(self) -> None:
+        encounter = EncounterInput(
+            encounter_id="SYN-TEST-RX",
+            note="SYNTHETIC TEST NOTE: Adult continues HTN.",
+            medications=[PhraseInput(phrase="HTN")],
+        )
+        rxnorm = FakeRxNormClient(
+            candidates=[CodeCandidate(code="9999", description="placeholder")]
+        )
+        results = map_encounter(
+            encounter,
+            icd10_client=FakeIcd10Client(),
+            rxnorm_client=rxnorm,
+        )
+        self.assertEqual(rxnorm.phrases, ["HTN"])
+        self.assertNotIn("hypertension", rxnorm.phrases)
+        self.assertEqual(results[0].source_phrase, "HTN")
+        self.assertEqual(results[0].entity_type, "medication")
+        self.assertEqual(results[0].suggested_code, "9999")
+
+
+UTI_MIXED_CANDIDATES = [
+    CodeCandidate(
+        code="O86.20",
+        description="Urinary tract infection following delivery, unspecified",
+    ),
+    CodeCandidate(
+        code="O23.40",
+        description="Unspecified infection of urinary tract in pregnancy, unspecified trimester",
+    ),
+    CodeCandidate(
+        code="P39.3",
+        description="Neonatal urinary tract infection",
+    ),
+    CodeCandidate(
+        code="N99.521",
+        description="Infection of incontinent external stoma of urinary tract",
+    ),
+    CodeCandidate(
+        code="Z87.440",
+        description="Personal history of urinary (tract) infections",
+    ),
+    CodeCandidate(
+        code="N39.0",
+        description="Urinary tract infection, site not specified",
+    ),
+]
+
+
+class ContextCompatibilityTests(unittest.TestCase):
+    def test_drops_unsupported_context_and_keeps_unspecified_uti(self) -> None:
+        note = "SYNTHETIC TEST NOTE: Adult presents with UTI."
+        kept = filter_context_compatible_candidates(
+            UTI_MIXED_CANDIDATES,
+            note,
+            "current",
+        )
+        codes = [item.code for item in kept]
+        self.assertEqual(codes, ["N39.0"])
+        self.assertNotIn("O86.20", codes)
+        self.assertNotIn("O23.40", codes)
+        self.assertNotIn("P39.3", codes)
+        self.assertNotIn("N99.521", codes)
+        self.assertNotIn("Z87.440", codes)
+
+    def test_keeps_delivery_code_when_note_states_postpartum(self) -> None:
+        note = "SYNTHETIC TEST NOTE: Adult postpartum patient presents with UTI."
+        kept = filter_context_compatible_candidates(
+            [
+                CodeCandidate(
+                    code="O86.20",
+                    description="Urinary tract infection following delivery, unspecified",
+                ),
+                CodeCandidate(
+                    code="N39.0",
+                    description="Urinary tract infection, site not specified",
+                ),
+            ],
+            note,
+            "current",
+        )
+        codes = [item.code for item in kept]
+        self.assertIn("O86.20", codes)
+        self.assertIn("N39.0", codes)
+
+    def test_historical_finding_may_retain_history_candidate(self) -> None:
+        note = "SYNTHETIC TEST NOTE: Adult has a history of UTI."
+        history = CodeCandidate(
+            code="Z87.440",
+            description="Personal history of urinary (tract) infections",
+        )
+        unspecified = CodeCandidate(
+            code="N39.0",
+            description="Urinary tract infection, site not specified",
+        )
+        kept = filter_context_compatible_candidates(
+            [history, unspecified],
+            note,
+            "historical",
+        )
+        codes = [item.code for item in kept]
+        self.assertIn("Z87.440", codes)
+        self.assertIn("N39.0", codes)
+
+        current_kept = filter_context_compatible_candidates(
+            [history, unspecified],
+            "SYNTHETIC TEST NOTE: Adult presents with UTI.",
+            "current",
+        )
+        self.assertEqual([item.code for item in current_kept], ["N39.0"])
+
+
+class PipelineContextCompatibilityTests(unittest.TestCase):
+    def test_syn006_prefers_n39_0_over_delivery_uti(self) -> None:
+        encounter = EncounterInput(
+            encounter_id="SYN-006",
+            note="SYNTHETIC TEST NOTE: Adult presents with UTI.",
+            diagnoses=[PhraseInput(phrase="UTI")],
+        )
+        icd10 = FakeIcd10Client(
+            by_phrase={"urinary tract infection": list(UTI_MIXED_CANDIDATES)}
+        )
+        results = map_encounter(
+            encounter,
+            icd10_client=icd10,
+            rxnorm_client=FakeRxNormClient(),
+        )
+        self.assertEqual(icd10.phrases, ["urinary tract infection"])
+        self.assertEqual(results[0].source_phrase, "UTI")
+        self.assertEqual(results[0].suggested_code, "N39.0")
+        self.assertEqual(results[0].review_status, "needs_review")
+        alt_codes = [item.code for item in results[0].alternatives]
+        self.assertNotIn("O86.20", alt_codes)
+        self.assertNotIn("O23.40", alt_codes)
+        self.assertNotIn("P39.3", alt_codes)
+        self.assertNotIn("N99.521", alt_codes)
+        self.assertNotIn("Z87.440", alt_codes)
+
+    def test_no_code_found_when_every_icd_candidate_needs_unsupported_context(self) -> None:
+        encounter = EncounterInput(
+            encounter_id="SYN-TEST-FILTER-ALL",
+            note="SYNTHETIC TEST NOTE: Adult presents with UTI.",
+            diagnoses=[PhraseInput(phrase="UTI")],
+        )
+        icd10 = FakeIcd10Client(
+            by_phrase={
+                "urinary tract infection": [
+                    CodeCandidate(
+                        code="O86.20",
+                        description="Urinary tract infection following delivery, unspecified",
+                    ),
+                    CodeCandidate(
+                        code="P39.3",
+                        description="Neonatal urinary tract infection",
+                    ),
+                ]
+            }
+        )
+        results = map_encounter(
+            encounter,
+            icd10_client=icd10,
+            rxnorm_client=FakeRxNormClient(),
+        )
+        self.assertEqual(results[0].review_status, "no_code_found")
+        self.assertIsNone(results[0].suggested_code)
+        self.assertEqual(results[0].alternatives, [])
+        self.assertEqual(
+            results[0].error_message,
+            "No context-compatible ICD-10-CM candidate was found.",
+        )
+        self.assertEqual(results[0].source_phrase, "UTI")
 
 
 if __name__ == "__main__":

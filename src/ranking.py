@@ -4,6 +4,8 @@ NLM search order is not a coding decision. This module only reorders codes
 the APIs already returned. It never invents a code.
 
 Rules (simple, no LLM):
+- Drop ICD candidates that need pregnancy, delivery, neonatal, stoma, or
+  (when current) personal-history context the note does not state.
 - Prefer generic labels (unspecified, without complications) when the note
   does not mention extra detail.
 - Downrank "with hyperglycemia"-style extras that are not in the note.
@@ -51,6 +53,63 @@ GENERIC_TOKENS = {
 HISTORICAL_DESC = ("old ", "old,", "history", "chronic", "sequela", "healed")
 ACUTE_DESC = ("acute",)
 STOPWORDS = {"the", "of", "a", "an", "and", "or", "to", "in", "for", "with"}
+
+# Description cues that need matching support in the note. Groups are
+# independent: "pregnant" does not unlock a "following delivery" code.
+CONTEXT_QUALIFIER_GROUPS = (
+    ("pregnancy", "pregnant", "trimester"),
+    ("delivery", "postpartum", "puerperium"),
+    ("abortion", "termination", "ectopic", "molar pregnancy"),
+    ("neonatal", "newborn"),
+    ("stoma",),
+)
+HISTORY_CUES = ("personal history", "history of")
+
+
+def filter_context_compatible_candidates(
+    candidates: list[CodeCandidate],
+    supporting_text: str,
+    clinical_context: ClinicalContext,
+) -> list[CodeCandidate]:
+    """Keep only ICD candidates whose extra context is stated in the note."""
+
+    return [
+        candidate
+        for candidate in candidates
+        if _is_context_compatible(candidate, supporting_text, clinical_context)
+    ]
+
+
+def _is_context_compatible(
+    candidate: CodeCandidate,
+    supporting_text: str,
+    clinical_context: ClinicalContext,
+) -> bool:
+    description = candidate.description
+    for cues in CONTEXT_QUALIFIER_GROUPS:
+        if _text_has_any_cue(description, cues) and not _text_has_any_cue(
+            supporting_text, cues
+        ):
+            return False
+    if clinical_context != "historical":
+        if _text_has_any_cue(description, HISTORY_CUES) and not _text_has_any_cue(
+            supporting_text, HISTORY_CUES
+        ):
+            return False
+    return True
+
+
+def _text_has_any_cue(text: str, cues: tuple[str, ...]) -> bool:
+    for cue in cues:
+        if _text_has_cue(text, cue):
+            return True
+    return False
+
+
+def _text_has_cue(text: str, cue: str) -> bool:
+    if " " in cue:
+        return cue.lower() in text.lower()
+    return bool(re.search(rf"\b{re.escape(cue)}\b", text, re.IGNORECASE))
 
 
 def rank_candidates(

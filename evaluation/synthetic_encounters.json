@@ -96,5 +96,18 @@
         "clinical_context": "current"
       }
     ]
+  },
+  {
+    "encounter_id": "SYN-006",
+    "data_type": "synthetic",
+    "scenario": "current abbreviation",
+    "note": "SYNTHETIC TEST NOTE: Adult presents with UTI. No real patient identifiers are included.",
+    "diagnoses": [
+      {
+        "phrase": "UTI",
+        "clinical_context": "current"
+      }
+    ],
+    "medications": []
   }
 ]

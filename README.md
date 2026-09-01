@@ -8,7 +8,7 @@ This version is a small, beginner-friendly Python pipeline. It does **not** tran
 
 1. Reads one synthetic clinical note plus a **manually supplied** list of diagnosis and medication phrases.
 2. Checks the sentence around each phrase for denied, historical, unconfirmed, or follow-up wording (rules, not sentiment and not an LLM).
-3. Searches official terminology APIs only for findings that may be coded.
+3. Searches official terminology APIs only for findings that may be coded. Current diagnosis abbreviations (such as `UTI`) are expanded for ICD-10 search only; RxNorm medication queries are left as written.
 4. Ranks the API hits so a generic code is preferred unless the note adds extra detail.
 5. Does **not** suggest a denied finding, an unconfirmed disease, or a follow-up visit reason as an active diagnosis, and does not attach ICD candidates for those rows. Documented symptoms can still be suggested.
 6. If a listed medication is written as `{drug} for {reason}`, also searches that stated reason as a diagnosis.
@@ -35,6 +35,7 @@ The app never invents a medical code or a symptom that is not in the note. If th
 | `src/main.py` | Command-line entry point. Loads synthetic encounters and prints JSON. |
 | `src/schemas.py` | Shared field names and types for inputs and outputs. |
 | `src/context.py` | Rule-based negated / historical / uncertain / follow-up checks, plus `{drug} for {reason}`. |
+| `src/abbreviations.py` | Small diagnosis abbreviation table used only as an ICD-10 search rewrite. |
 | `src/ranking.py` | Reorders official API candidates. Prefer generic unless the note is specific. |
 | `src/pipeline.py` | Steps through each phrase, calls the right API, and builds the JSON rows. |
 | `src/terminology/__init__.py` | Package file for the API clients. |
@@ -42,7 +43,7 @@ The app never invents a medical code or a symptom that is not in the note. If th
 | `src/terminology/rxnorm.py` | Medication search using the official NLM RxNorm API. |
 | `tests/__init__.py` | Marks `tests` as a package. |
 | `tests/test_pipeline.py` | Tests with fake API responses and synthetic phrases only. |
-| `evaluation/synthetic_encounters.json` | Five made-up encounters used for local runs. |
+| `evaluation/synthetic_encounters.json` | Six made-up encounters used for local runs. |
 
 ## Important coding decisions
 
@@ -53,6 +54,8 @@ The app never invents a medical code or a symptom that is not in the note. If th
 **Generic unless the note is specific.** NLM's first search hit is not a coding decision. The client asks for enough ICD-10 hits that a generic code such as `I10` can appear, then ranking prefers it over `renovascular` / `resistant` when those words are not in the note.
 
 **Context is derived from the note.** Version 2 does not trust the JSON `clinical_context` field as the source of truth. `denies chest pain` is not an active diagnosis. `history of myocardial infarction` prefers old-MI style candidates. `possible pneumonia` with imaging pending is not coded as pneumonia (no pneumonia ICD candidates). `follow-up for UTI` is a visit reason, not an active UTI, and is not searched (so the API cannot return carbon monoxide / utility-gas codes).
+
+**Diagnosis abbreviations are expanded only for ICD-10 search.** A current listed phrase such as `UTI` still appears as `UTI` in `source_phrase`, but the ICD-10 query becomes `urinary tract infection`. Denied, uncertain, and follow-up diagnoses still skip the ICD API entirely, even if the phrase is a known abbreviation. RxNorm medication queries are not rewritten by this table.
 
 **Validate before keeping a code.** ICD-10-CM codes must match the usual code pattern (for example `E11.9`). RxNorm IDs must be numeric RxCUIs, and each ID is checked with RxNorm's properties endpoint so inactive or empty concepts are dropped.
 
@@ -91,7 +94,7 @@ Still inside the activated virtual environment, from the project folder:
 python -m src.main
 ```
 
-That maps all five synthetic encounters and prints JSON.
+That maps all six synthetic encounters and prints JSON.
 
 Run one encounter:
 
@@ -121,7 +124,7 @@ Each JSON row contains:
 | --- | --- |
 | `encounter_id` | ID from the synthetic file, such as `SYN-001`. |
 | `source_text` | The full synthetic note. |
-| `source_phrase` | The phrase that was searched (listed or inferred from `{drug} for {reason}`). |
+| `source_phrase` | The original listed phrase (or inferred `{drug} for {reason}` query). Diagnosis abbreviations are not rewritten here. |
 | `clinical_context` | `current`, `negated`, `historical`, `uncertain`, or `follow_up`, detected from the note. |
 | `entity_type` | `diagnosis` or `medication`. |
 | `code_system` | `ICD-10-CM` or `RxNorm`. |
@@ -144,8 +147,9 @@ All notes in `evaluation/synthetic_encounters.json` are labeled `SYNTHETIC TEST 
 | SYN-003 | Historical condition (`history of myocardial infarction`) prefers old-MI style candidates, not acute MI. |
 | SYN-004 | Documented `cough` and `fever` can be suggested. `possible pneumonia` with chest x-ray pending is `do_not_code` with no ICD candidates. Azithromycin is only considered if imaging confirms, so it is not a current med. |
 | SYN-005 | `follow-up for UTI` is not an active diagnosis (no ICD search, so no carbon monoxide / utility-gas codes). HCTZ has no stated reason, so no extra diagnosis is inferred. HCTZ can still map as a medication. |
+| SYN-006 | Current `UTI` keeps `source_phrase` as `UTI` and searches ICD-10 for `urinary tract infection`. |
 
-Abbreviations are not expanded yet. If a current abbreviation were searched in ICD-10-CM, `UTI` could still match **utility** in names. SYN-005 avoids that by not searching follow-up visit reasons.
+Diagnosis abbreviations (`UTI`, `HTN`, `T2DM`, `MI`) are expanded only as ICD-10 search queries, and only when the finding may be coded. Follow-up `UTI` in SYN-005 is still not searched.
 
 ## Later versions (not built yet)
 

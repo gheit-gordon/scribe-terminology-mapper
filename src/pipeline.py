@@ -5,12 +5,14 @@ file) supplies diagnosis and medication phrases. The pipeline then:
 
 1. Detects negated / historical / uncertain / follow-up context from the note.
 2. Searches official terminology APIs only for findings that may be coded.
-3. Ranks validated candidates (generic unless the note is specific).
-4. Does not suggest negated, unconfirmed, or follow-up diseases as codes
+3. Expands known diagnosis abbreviations for ICD-10 search only (not RxNorm).
+4. Drops ICD candidates that need unsupported context, then ranks the rest.
+5. Ranks validated candidates (generic unless the note is specific).
+6. Does not suggest negated, unconfirmed, or follow-up diseases as codes
    and does not attach API candidates for those rows.
-5. If a listed med is written as '{drug} for {reason}', also searches
+7. If a listed med is written as '{drug} for {reason}', also searches
    that stated reason as a diagnosis.
-6. Leaves confidence as null.
+8. Leaves confidence as null.
 """
 
 from __future__ import annotations
@@ -18,12 +20,13 @@ from __future__ import annotations
 import os
 from typing import Any, Callable
 
+from src.abbreviations import expand_abbreviations
 from src.context import (
     detect_clinical_context,
     diagnosis_query_for_reason,
     extract_medication_reason,
 )
-from src.ranking import rank_candidates
+from src.ranking import filter_context_compatible_candidates, rank_candidates
 from src.schemas import (
     ClinicalContext,
     CodeCandidate,
@@ -103,6 +106,7 @@ def map_encounter(
                 search=icd10_client.search,
                 api_error_type=Icd10ApiError,
                 clinical_context=context,
+                normalize_query=True,
             )
         )
 
@@ -117,6 +121,7 @@ def map_encounter(
                 search=rxnorm_client.search,
                 api_error_type=RxNormApiError,
                 clinical_context=context,
+                normalize_query=False,
             )
         )
         extra = _diagnosis_from_medication_reason(
@@ -156,6 +161,7 @@ def _diagnosis_from_medication_reason(
         api_error_type=Icd10ApiError,
         clinical_context="current",
         inference_source="medication_reason",
+        normalize_query=True,
     )
 
 
@@ -168,6 +174,7 @@ def _map_phrase(
     api_error_type: type[Exception],
     clinical_context: ClinicalContext,
     inference_source: InferenceSource = "listed_phrase",
+    normalize_query: bool = False,
 ) -> MappingResult:
     if not phrase.phrase:
         return _result(
@@ -199,8 +206,10 @@ def _map_phrase(
             inference_source=inference_source,
         )
 
+    query = expand_abbreviations(phrase.phrase) if normalize_query else phrase.phrase
+
     try:
-        candidates = search(phrase.phrase)
+        candidates = search(query)
     except api_error_type as exc:
         return _result(
             encounter,
@@ -229,7 +238,27 @@ def _map_phrase(
             inference_source=inference_source,
         )
 
-    ranked = rank_candidates(candidates, phrase.phrase, encounter.note, clinical_context)
+    if code_system == "ICD-10-CM":
+        candidates = filter_context_compatible_candidates(
+            candidates,
+            encounter.note,
+            clinical_context,
+        )
+        if not candidates:
+            return _result(
+                encounter,
+                phrase,
+                entity_type,
+                code_system,
+                suggested=None,
+                alternatives=[],
+                review_status="no_code_found",
+                error_message="No context-compatible ICD-10-CM candidate was found.",
+                clinical_context=clinical_context,
+                inference_source=inference_source,
+            )
+
+    ranked = rank_candidates(candidates, query, encounter.note, clinical_context)
     suggested, *alternatives = ranked
     return _result(
         encounter,
