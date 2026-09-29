@@ -9,6 +9,8 @@ Rules (simple, no LLM):
 - Prefer generic labels (unspecified, without complications) when the note
   does not mention extra detail.
 - Downrank "with hyperglycemia"-style extras that are not in the note.
+- Boost the same extras when the note or phrase does state them, so a
+  supported specific code can beat a generic unspecified hit.
 - If the finding is historical, prefer old/history labels over acute ones.
 """
 
@@ -153,8 +155,13 @@ def _score_candidate(
 
     for extra in re.finditer(r"\bwith\s+([a-z0-9]+(?:\s+[a-z0-9]+){0,3})", description):
         extra_text = extra.group(1).strip()
-        if extra_text and extra_text not in haystack:
+        if not extra_text:
+            continue
+        if extra_text not in haystack:
             score -= 6
+        else:
+            # Beat the generic +5 so documented specificity can win.
+            score += 8
 
     phrase_tokens = _content_tokens(phrase)
     description_tokens = _content_tokens(description)

@@ -2,9 +2,13 @@
 
 Prototype repo: [scribe-terminology-mapper](https://github.com/ItsNotGordon/scribe-terminology-mapper)
 
-Current branch: `main`. Last **local** commit: `0ee0996` (abbreviation expansion + context-compatibility filter). **Ahead of origin by 1 commit; do not push unless asked.** Last **pushed** commit: `d09d173`. `docs/` (this PRD and the handoff) is still **uncommitted**.
+Current branch: `main`. Last **local** commit: `0ee0996` (abbreviation expansion + context-compatibility filter). **Ahead of origin by 1 commit; do not push unless asked.** Last **pushed** commit: `d09d173`. Uncommitted work includes `docs/` ([`ARCHITECTURE.md`](ARCHITECTURE.md), this PRD, the handoff), SYN-007–SYN-010, ranking for supported specificity, and tests. Do not commit or push unless asked.
+
+Stage picture: [`docs/ARCHITECTURE.md`](ARCHITECTURE.md). Mapping is implemented. LLM phrase extraction is planned. Live transcription is **deferred during this mapping phase** and **confirmed in the final project scope**.
 
 Data policy: **synthetic notes only**. No real patient information.
+
+Listed `diagnoses[].phrase` and `medications[].phrase` values are **gold extraction labels** for a future LLM extractor. Every gold phrase appears in that encounter’s note. `{drug} for {reason}` mapping rows are not gold labels.
 
 ---
 
@@ -22,7 +26,8 @@ Hard constraints from day one:
 - Never invent medical codes
 - Never put real PHI in the project
 - No LLM yet
-- No audio, frontend, FHIR, AWS, extra code systems, or fine-tuning
+- No audio in **this mapping phase** (live transcription is confirmed later; see [`ARCHITECTURE.md`](ARCHITECTURE.md))
+- No frontend, FHIR, AWS, extra code systems, or fine-tuning
 - Keep the code modular for a later company backend
 
 ### Version 1 — lookup only
@@ -103,7 +108,13 @@ A live SYN-006 run suggested **O86.20** (UTI following delivery) even though the
 
 `filter_context_compatible_candidates` now removes those unsupported ICD descriptions **before** ranking. Remaining generic codes (such as N39.0) can then win. This is not a hardcoded “UTI always means N39.0” rule. If every retrieved ICD candidate needs unsupported context, the row is `no_code_found` with empty alternatives — the unfiltered list is never used as a fallback. Historical findings may still keep a personal-history candidate. RxNorm is not filtered this way.
 
-Live verification after that change: SYN-006 suggested **N39.0**; SYN-005 stayed `do_not_code` for follow-up UTI with HCTZ as RxNorm only. Mocked suite: **36 tests, OK**.
+Live verification after that change: SYN-006 suggested **N39.0**; SYN-005 stayed `do_not_code` for follow-up UTI with HCTZ as RxNorm only. Mocked suite at that point: **36 tests, OK**.
+
+### Gold labels and richer evaluation notes
+
+Listed phrases in `evaluation/synthetic_encounters.json` are now treated as **gold spans** for a future extraction stage. They must appear in the note. SYN-007–SYN-010 add coverage the first six did not stress: several current entities in one visit, negation that must not leak to the next sentence, a diagnosis whose extra detail **is** in the note, and mixed historical plus current problems.
+
+Ranking was updated so a documented `with X` extra (for example hyperglycemia) can beat a generic unspecified hit. SYN-001 still prefers E11.9 when hyperglycemia is absent. SYN-009 prefers E11.65 when it is present. This is still ranking of official NLM hits, not a hardcoded code.
 
 ---
 
@@ -152,14 +163,20 @@ It is **not** an EHR, not a coder of record, and not an LLM coder.
 | Infer diagnosis from med only with a written reason | lisinopril **for blood pressure** → hypertension search; HCTZ alone → no I10 |
 | Honest uncertainty | `confidence` is always `null` |
 | Synthetic data only | All notes labeled `SYNTHETIC TEST NOTE` |
+| Gold extraction labels | Listed phrases appear in the note; they are the eval gold for a future extractor |
+| Prefer specific when the note states it | Diabetes **with hyperglycemia** in the note → E11.65-class, not E11.9 |
+| Multiple entities stay independent | SYN-007 maps both current diagnoses and both meds; no drug-class inference |
+| Negation is sentence-scoped | SYN-008 codes T2DM; denied chest pain is `do_not_code` |
+| Mixed history and current | SYN-010 old-MI for history of MI; current T2DM is not treated as historical |
 
-### 5. Non-goals (now)
+### 5. Non-goals (this mapping phase)
 
-- LLM phrase extraction or code selection
+- LLM phrase extraction or code selection (extraction is **planned**, not built)
 - Sentiment analysis / custom neural nets
 - Inferring indication from drug class
 - A disease-to-required-test encyclopedia
-- Audio, UI, FHIR, AWS, extra code systems (CPT, SNOMED, etc.)
+- Audio / speech-to-text **in this phase** (live transcription is **confirmed in the final project scope**; it will emit `note` text only)
+- UI, FHIR, AWS, extra code systems (CPT, SNOMED, etc.)
 - Real patient notes
 - Inpatient “code possible diagnoses as if confirmed” rules (this prototype follows **outpatient / scribe** practice)
 
@@ -169,7 +186,7 @@ It is **not** an EHR, not a coder of record, and not an LLM coder.
 
 - `encounter_id`, synthetic `note`
 - Manual lists: `diagnoses[].phrase`, `medications[].phrase`
-- JSON `clinical_context` is **not** trusted; context is detected from the note
+- Those listed phrases are **gold extraction labels** (must appear in the note). JSON `clinical_context` is **not** trusted at runtime; context is detected from the note. For SYN-007–SYN-010 the JSON context matches the intended gold label for later eval. Do not “fix” SYN-005’s JSON `current`.
 
 **Pipeline**
 
@@ -185,7 +202,7 @@ It is **not** an EHR, not a coder of record, and not an LLM coder.
    - Diagnoses: expand known whole-token abbreviations (`UTI` → `urinary tract infection`, `HTN` → `hypertension`, `T2DM` → `type 2 diabetes mellitus`, `MI` → `myocardial infarction`), then NLM Clinical Tables ICD-10-CM (`sf=code,name`, about 20 hits). Original phrase stays in `source_phrase`.
    - Medications: RxNorm name search using the **original** medication phrase, then properties lookup to confirm RxCUI
 5. Filter ICD-10 candidates for **context compatibility** using the clinical note (not only the search phrase). Drop descriptions that require pregnancy, delivery/postpartum, abortion/ectopic, neonatal/newborn, stoma, or (when the finding is current) personal history, unless that context is in the note. Historical findings may keep history-code candidates. If NLM returned hits but none are compatible → `no_code_found`, empty alternatives, no fallback to the unfiltered list.
-6. Rank remaining candidates: prefer unspecified / without complications / essential (primary); downrank extra adjectives not in the note; historical prefers old over acute.
+6. Rank remaining candidates: prefer unspecified / without complications / essential (primary) when the note is not specific; **boost** description extras (`with hyperglycemia`) that the note or phrase does state; downrank extra adjectives not in the note; historical prefers old over acute.
 7. If a listed med matches `{drug} for {reason}`, also search the stated reason (for example blood pressure → hypertension) as a diagnosis with `inference_source: medication_reason`. That ICD search may expand abbreviations and uses the same compatibility filter.
 
 **Output (each JSON row)**
@@ -206,17 +223,23 @@ It is **not** an EHR, not a coder of record, and not an LLM coder.
 | SYN-004 | Cough, fever; possible pneumonia, CXR pending; consider azithromycin if imaging confirms | Suggest cough/fever; pneumonia and azithromycin do_not_code, no disease/med candidates |
 | SYN-005 | Follow-up for UTI; continues HCTZ | UTI do_not_code, no ICD search; HCTZ RxNorm only; no hypertension |
 | SYN-006 | Adult presents with UTI | `source_phrase` stays `UTI`; ICD search is `urinary tract infection`; suggest N39.0-class unspecified UTI, **not** O86.20 |
+| SYN-007 | T2DM and hypertension; metformin and lisinopril (no `for`) | Generic T2DM (not E11.65) + **I10** + both RxCUIs; no extra hypertension from drug class |
+| SYN-008 | T2DM. Denies chest pain. Continues metformin | T2DM `needs_review`; chest pain `do_not_code` (no ICD search); metformin RxNorm |
+| SYN-009 | T2DM **with hyperglycemia**; metformin | Prefer **E11.65** over E11.9; metformin RxNorm |
+| SYN-010 | History of MI; current T2DM; aspirin and metformin | Old-MI (I25.2-style) for MI; generic T2DM; both meds current |
 
-Tests: `python -m unittest` (mocked APIs, no PHI, no live NLM). Last run: 36 tests, OK. Live `src.main` for SYN-005 / SYN-006 was rechecked after the compatibility filter.
+Tests: `python -m unittest` (mocked APIs, no PHI, no live NLM). Live `src.main` for all ten encounters after this slice. Listed phrases are gold extraction labels.
 
 ### 8. Architecture
+
+Stage picture and text contract: [`docs/ARCHITECTURE.md`](ARCHITECTURE.md). Mapping is implemented. LLM extraction is planned. Live transcription is deferred now and confirmed later.
 
 ```
 synthetic JSON → main.py → pipeline.py
                       ├─ context.py (cues)
                       ├─ abbreviations.py (ICD search rewrite only)
                       ├─ icd10.py / rxnorm.py (NLM)
-                      └─ ranking.py (context-compatible, then generic-first)
+                      └─ ranking.py (context-compatible, then generic unless the note is specific)
                  → JSON rows for a human
 ```
 
@@ -233,12 +256,15 @@ Dependencies: `requests`, `python-dotenv`. No API key for these public NLM endpo
 - Do not treat NLM row 1 as the clinically correct code
 - Expand known diagnosis abbreviations only for ICD-10 search, and only after deciding the finding may be coded
 - Do not suggest an ICD-10 code that requires pregnancy, delivery, neonatal, stoma, or (when current) personal-history context unless the note states that context
+- Prefer a more specific official hit when the note states that extra detail; prefer generic when it does not
+- Listed synthetic phrases are gold extraction labels, not a license to invent spans later
 
 ### 10. Open issues / next PRD slice
 
 These are **not** built:
 
-- LLM **phrase extraction only**, still never LLM-invented codes
+- LLM **phrase extraction only**, still never LLM-invented codes (gold labels in the synthetic JSON are ready for that eval)
+- Live transcription (confirmed in **final** scope; deferred until mapping and then extraction are solid; emits `note` text only)
 - Human review UI
 - Company backend / FHIR
 - Richer notes (the synthetic charts are still short compared with real scribe notes)
@@ -248,4 +274,6 @@ These are **not** built:
 
 ## Bottom line
 
-The product is a **safe lookup-and-filter layer** on official terminology APIs. Version 1 proved retrieval. Version 2 taught **most of the work is deciding what not to code**, then ranking generic official codes for what remains. Abbreviation expansion rewrites the ICD search for current findings only. Context-compatibility then drops official hits that still require a setting the note never describes, so a plain adult UTI cannot surface as UTI following delivery.
+The product is a **safe lookup-and-filter layer** on official terminology APIs. Version 1 proved retrieval. Version 2 taught **most of the work is deciding what not to code**, then ranking official codes: generic when the note is not specific, more specific when the note states that extra detail. Abbreviation expansion rewrites the ICD search for current findings only. Context-compatibility then drops official hits that still require a setting the note never describes, so a plain adult UTI cannot surface as UTI following delivery.
+
+Audio is not part of this mapping phase. It is a confirmed later stage that only produces text. LLM extraction is the planned middle stage and must never invent codes.

@@ -109,5 +109,97 @@
       }
     ],
     "medications": []
+  },
+  {
+    "encounter_id": "SYN-007",
+    "data_type": "synthetic",
+    "scenario": "multiple current entities",
+    "note": "SYNTHETIC TEST NOTE: Adult presents with type 2 diabetes mellitus and hypertension. Continues metformin and lisinopril. No real patient identifiers are included.",
+    "diagnoses": [
+      {
+        "phrase": "type 2 diabetes mellitus",
+        "clinical_context": "current"
+      },
+      {
+        "phrase": "hypertension",
+        "clinical_context": "current"
+      }
+    ],
+    "medications": [
+      {
+        "phrase": "metformin",
+        "clinical_context": "current"
+      },
+      {
+        "phrase": "lisinopril",
+        "clinical_context": "current"
+      }
+    ]
+  },
+  {
+    "encounter_id": "SYN-008",
+    "data_type": "synthetic",
+    "scenario": "narrow negation scope",
+    "note": "SYNTHETIC TEST NOTE: Adult presents with type 2 diabetes mellitus. Denies chest pain. Continues metformin. No real patient identifiers are included.",
+    "diagnoses": [
+      {
+        "phrase": "type 2 diabetes mellitus",
+        "clinical_context": "current"
+      },
+      {
+        "phrase": "chest pain",
+        "clinical_context": "negated"
+      }
+    ],
+    "medications": [
+      {
+        "phrase": "metformin",
+        "clinical_context": "current"
+      }
+    ]
+  },
+  {
+    "encounter_id": "SYN-009",
+    "data_type": "synthetic",
+    "scenario": "supported diagnosis specificity",
+    "note": "SYNTHETIC TEST NOTE: Adult presents with type 2 diabetes mellitus with hyperglycemia. Started metformin 500 mg daily. No real patient identifiers are included.",
+    "diagnoses": [
+      {
+        "phrase": "type 2 diabetes mellitus with hyperglycemia",
+        "clinical_context": "current"
+      }
+    ],
+    "medications": [
+      {
+        "phrase": "metformin",
+        "clinical_context": "current"
+      }
+    ]
+  },
+  {
+    "encounter_id": "SYN-010",
+    "data_type": "synthetic",
+    "scenario": "mixed historical and current",
+    "note": "SYNTHETIC TEST NOTE: Adult has a history of myocardial infarction. Currently presents with type 2 diabetes mellitus. Continues aspirin and metformin. No real patient identifiers are included.",
+    "diagnoses": [
+      {
+        "phrase": "myocardial infarction",
+        "clinical_context": "historical"
+      },
+      {
+        "phrase": "type 2 diabetes mellitus",
+        "clinical_context": "current"
+      }
+    ],
+    "medications": [
+      {
+        "phrase": "aspirin",
+        "clinical_context": "current"
+      },
+      {
+        "phrase": "metformin",
+        "clinical_context": "current"
+      }
+    ]
   }
 ]

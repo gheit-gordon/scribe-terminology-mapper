@@ -4,12 +4,14 @@ A prototype that converts clinical text into validated ICD-10-CM diagnosis and R
 
 This version is a small, beginner-friendly Python pipeline. It does **not** transcribe audio, open a website, send data to FHIR, deploy to AWS, or fine-tune a model. It also does **not** call an LLM.
 
+Live transcription is **deferred in this mapping phase** and **confirmed in the final project scope** (audio → `note` text only). LLM phrase extraction is planned next and must never invent codes. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
 ## What this version does
 
 1. Reads one synthetic clinical note plus a **manually supplied** list of diagnosis and medication phrases.
 2. Checks the sentence around each phrase for denied, historical, unconfirmed, or follow-up wording (rules, not sentiment and not an LLM).
 3. Searches official terminology APIs only for findings that may be coded. Current diagnosis abbreviations (such as `UTI`) are expanded for ICD-10 search only; RxNorm medication queries are left as written.
-4. Ranks the API hits so a generic code is preferred unless the note adds extra detail.
+4. Ranks the API hits so a generic code is preferred unless the note adds extra detail (for example hyperglycemia).
 5. Does **not** suggest a denied finding, an unconfirmed disease, or a follow-up visit reason as an active diagnosis, and does not attach ICD candidates for those rows. Documented symptoms can still be suggested.
 6. If a listed medication is written as `{drug} for {reason}`, also searches that stated reason as a diagnosis.
 7. Prints structured JSON for a human to review.
@@ -28,6 +30,9 @@ The app never invents a medical code or a symptom that is not in the note. If th
 | File | What it is for |
 | --- | --- |
 | `README.md` | This guide: setup, run, and design notes. |
+| `docs/ARCHITECTURE.md` | Stage picture: mapping now, LLM extraction planned, live transcription later. |
+| `docs/PRD.md` | Product history and requirements. |
+| `docs/HANDOFF.md` | Checklist for the next chat. |
 | `.gitignore` | Tells Git to ignore secrets, virtual environments, and OS junk. |
 | `.env.example` | Sample settings you can copy to `.env`. No API key is required. |
 | `requirements.txt` | The small list of Python packages to install. |
@@ -43,15 +48,15 @@ The app never invents a medical code or a symptom that is not in the note. If th
 | `src/terminology/rxnorm.py` | Medication search using the official NLM RxNorm API. |
 | `tests/__init__.py` | Marks `tests` as a package. |
 | `tests/test_pipeline.py` | Tests with fake API responses and synthetic phrases only. |
-| `evaluation/synthetic_encounters.json` | Six made-up encounters used for local runs. |
+| `evaluation/synthetic_encounters.json` | Ten made-up encounters used for local runs. Listed phrases are gold extraction labels. |
 
 ## Important coding decisions
 
-**No LLM.** Phrase extraction is not automated. Each synthetic encounter already lists the phrases to search. Context uses a short cue list on the sentence that contains the phrase.
+**No LLM in this version.** Phrase extraction is not automated. Each synthetic encounter already lists the phrases to search; those lists are **gold labels** for a future extractor. Context uses a short cue list on the sentence that contains the phrase.
 
 **Authoritative APIs only.** Diagnoses go to the [NLM Clinical Tables ICD-10-CM API](https://clinicaltables.nlm.nih.gov/apidoc/icd10cm/v3/doc.html). Medications go to the [NLM RxNorm REST API](https://lhncbc.nlm.nih.gov/RxNav/APIs/RxNormAPIs.html). After validation, `ranking.py` picks a suggested code. Extra validated hits become `alternatives`.
 
-**Generic unless the note is specific.** NLM's first search hit is not a coding decision. The client asks for enough ICD-10 hits that a generic code such as `I10` can appear, then ranking prefers it over `renovascular` / `resistant` when those words are not in the note.
+**Generic unless the note is specific.** NLM's first search hit is not a coding decision. The client asks for enough ICD-10 hits that a generic code such as `I10` can appear, then ranking prefers it over `renovascular` / `resistant` when those words are not in the note. If the note **does** state extra detail (hyperglycemia), ranking prefers the matching official specific hit.
 
 **Context is derived from the note.** Version 2 does not trust the JSON `clinical_context` field as the source of truth. `denies chest pain` is not an active diagnosis. `history of myocardial infarction` prefers old-MI style candidates. `possible pneumonia` with imaging pending is not coded as pneumonia (no pneumonia ICD candidates). `follow-up for UTI` is a visit reason, not an active UTI, and is not searched (so the API cannot return carbon monoxide / utility-gas codes).
 
@@ -94,7 +99,7 @@ Still inside the activated virtual environment, from the project folder:
 python -m src.main
 ```
 
-That maps all six synthetic encounters and prints JSON.
+That maps all ten synthetic encounters and prints JSON.
 
 Run one encounter:
 
@@ -148,14 +153,17 @@ All notes in `evaluation/synthetic_encounters.json` are labeled `SYNTHETIC TEST 
 | SYN-004 | Documented `cough` and `fever` can be suggested. `possible pneumonia` with chest x-ray pending is `do_not_code` with no ICD candidates. Azithromycin is only considered if imaging confirms, so it is not a current med. |
 | SYN-005 | `follow-up for UTI` is not an active diagnosis (no ICD search, so no carbon monoxide / utility-gas codes). HCTZ has no stated reason, so no extra diagnosis is inferred. HCTZ can still map as a medication. |
 | SYN-006 | Current `UTI` keeps `source_phrase` as `UTI` and searches ICD-10 for `urinary tract infection`. |
+| SYN-007 | Two current diagnoses and two current meds. Generic T2DM + I10; no hypertension inferred from lisinopril (no `for`). |
+| SYN-008 | Sentence-scoped negation: T2DM is coded; denied chest pain is not searched. |
+| SYN-009 | Note states hyperglycemia, so ranking should prefer E11.65 over E11.9. |
+| SYN-010 | History of MI (old-MI style) plus current T2DM; aspirin and metformin current. |
 
-Diagnosis abbreviations (`UTI`, `HTN`, `T2DM`, `MI`) are expanded only as ICD-10 search queries, and only when the finding may be coded. Follow-up `UTI` in SYN-005 is still not searched.
+Diagnosis abbreviations (`UTI`, `HTN`, `T2DM`, `MI`) are expanded only as ICD-10 search queries, and only when the finding may be coded. Follow-up `UTI` in SYN-005 is still not searched. Listed phrases are gold extraction labels and must appear in the note.
 
 ## Later versions (not built yet)
 
-Possible next steps, without changing this version's scope:
-
-- Use an LLM only to extract phrases, never to invent codes.
+- Use an LLM only to extract phrases, never to invent codes. Score against the listed gold phrases.
+- Add live transcription after extraction is solid: audio → `note` text only (confirmed in the final project scope; not this version).
 - Add a human review UI.
 - Send approved codes into a company backend or FHIR resources.
 - Add more code systems after the current two are solid.

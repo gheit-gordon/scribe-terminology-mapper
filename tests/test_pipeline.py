@@ -56,22 +56,26 @@ class FakeIcd10Client:
 
 
 class FakeRxNormClient:
-    def __init__(self, candidates=None, error=None) -> None:
+    def __init__(self, candidates=None, error=None, by_phrase=None) -> None:
         self.candidates = candidates or []
         self.error = error
+        self.by_phrase = {key.lower(): value for key, value in (by_phrase or {}).items()}
         self.phrases: list[str] = []
 
     def search(self, phrase: str):
         self.phrases.append(phrase)
         if self.error:
             raise self.error
+        mapped = self.by_phrase.get(phrase.lower())
+        if mapped is not None:
+            return list(mapped)
         return list(self.candidates)
 
 
 class SchemaAndFileTests(unittest.TestCase):
-    def test_synthetic_file_covers_five_required_scenarios(self) -> None:
+    def test_synthetic_file_covers_required_scenarios(self) -> None:
         raw = json.loads(ENCOUNTERS_FILE.read_text(encoding="utf-8"))
-        self.assertEqual(len(raw), 6)
+        self.assertEqual(len(raw), 10)
         scenarios = {item["scenario"] for item in raw}
         self.assertEqual(
             scenarios,
@@ -82,6 +86,10 @@ class SchemaAndFileTests(unittest.TestCase):
                 "uncertain diagnosis",
                 "abbreviation",
                 "current abbreviation",
+                "multiple current entities",
+                "narrow negation scope",
+                "supported diagnosis specificity",
+                "mixed historical and current",
             },
         )
         for item in raw:
@@ -110,6 +118,55 @@ class SchemaAndFileTests(unittest.TestCase):
         self.assertIn("UTI", syn006["note"])
         self.assertNotIn("follow-up", syn006["note"].lower())
         self.assertEqual([item["phrase"] for item in syn006["diagnoses"]], ["UTI"])
+
+        syn007 = next(item for item in raw if item["encounter_id"] == "SYN-007")
+        self.assertEqual(
+            [item["phrase"] for item in syn007["diagnoses"]],
+            ["type 2 diabetes mellitus", "hypertension"],
+        )
+        self.assertEqual(
+            [item["phrase"] for item in syn007["medications"]],
+            ["metformin", "lisinopril"],
+        )
+        self.assertNotIn(" for ", syn007["note"])
+
+        syn008 = next(item for item in raw if item["encounter_id"] == "SYN-008")
+        self.assertEqual(
+            [item["phrase"] for item in syn008["diagnoses"]],
+            ["type 2 diabetes mellitus", "chest pain"],
+        )
+        self.assertIn("denies chest pain", syn008["note"].lower())
+
+        syn009 = next(item for item in raw if item["encounter_id"] == "SYN-009")
+        self.assertEqual(
+            [item["phrase"] for item in syn009["diagnoses"]],
+            ["type 2 diabetes mellitus with hyperglycemia"],
+        )
+        self.assertIn("hyperglycemia", syn009["note"].lower())
+
+        syn010 = next(item for item in raw if item["encounter_id"] == "SYN-010")
+        self.assertEqual(
+            [item["phrase"] for item in syn010["diagnoses"]],
+            ["myocardial infarction", "type 2 diabetes mellitus"],
+        )
+        self.assertEqual(
+            [item["phrase"] for item in syn010["medications"]],
+            ["aspirin", "metformin"],
+        )
+
+    def test_listed_phrases_are_attested_in_the_note(self) -> None:
+        raw = json.loads(ENCOUNTERS_FILE.read_text(encoding="utf-8"))
+        for item in raw:
+            note_lower = item["note"].lower()
+            listed = list(item.get("diagnoses", [])) + list(item.get("medications", []))
+            self.assertTrue(listed, f"{item['encounter_id']} has no gold phrases")
+            for phrase_item in listed:
+                phrase = phrase_item["phrase"]
+                self.assertIn(
+                    phrase.lower(),
+                    note_lower,
+                    f"{item['encounter_id']} gold phrase {phrase!r} is not in the note",
+                )
 
     def test_mapping_json_uses_null_confidence(self) -> None:
         encounter = EncounterInput(
@@ -244,6 +301,18 @@ class RankingTests(unittest.TestCase):
         )
         self.assertEqual(ranked[0].code, "I10")
 
+    def test_prefers_hyperglycemia_when_note_states_it(self) -> None:
+        ranked = rank_candidates(
+            [
+                CodeCandidate(code="E11.9", description="Type 2 diabetes mellitus without complications"),
+                CodeCandidate(code="E11.65", description="Type 2 diabetes mellitus with hyperglycemia"),
+            ],
+            phrase="type 2 diabetes mellitus with hyperglycemia",
+            note="SYNTHETIC TEST NOTE: Adult presents with type 2 diabetes mellitus with hyperglycemia.",
+            clinical_context="current",
+        )
+        self.assertEqual(ranked[0].code, "E11.65")
+
 
 class ContextTests(unittest.TestCase):
     def test_detects_negation_history_and_uncertainty(self) -> None:
@@ -273,6 +342,15 @@ class ContextTests(unittest.TestCase):
             detect_clinical_context("Adult follow-up for UTI. Continues HCTZ.", "UTI"),
             "follow_up",
         )
+
+    def test_negation_does_not_leak_to_the_next_sentence(self) -> None:
+        note = (
+            "SYNTHETIC TEST NOTE: Adult presents with type 2 diabetes mellitus. "
+            "Denies chest pain. Continues metformin."
+        )
+        self.assertEqual(detect_clinical_context(note, "type 2 diabetes mellitus"), "current")
+        self.assertEqual(detect_clinical_context(note, "chest pain"), "negated")
+        self.assertEqual(detect_clinical_context(note, "metformin"), "current")
 
     def test_later_no_identifiers_line_does_not_negate_the_phrase(self) -> None:
         note = (
@@ -804,6 +882,224 @@ class PipelineContextCompatibilityTests(unittest.TestCase):
             "No context-compatible ICD-10-CM candidate was found.",
         )
         self.assertEqual(results[0].source_phrase, "UTI")
+
+
+class EvaluationEncounterTests(unittest.TestCase):
+    def test_syn007_maps_multiple_current_entities_without_med_inference(self) -> None:
+        encounter = EncounterInput(
+            encounter_id="SYN-007",
+            note=(
+                "SYNTHETIC TEST NOTE: Adult presents with type 2 diabetes mellitus "
+                "and hypertension. Continues metformin and lisinopril. "
+                "No real patient identifiers are included."
+            ),
+            diagnoses=[
+                PhraseInput(phrase="type 2 diabetes mellitus"),
+                PhraseInput(phrase="hypertension"),
+            ],
+            medications=[
+                PhraseInput(phrase="metformin"),
+                PhraseInput(phrase="lisinopril"),
+            ],
+        )
+        icd10 = FakeIcd10Client(
+            by_phrase={
+                "type 2 diabetes mellitus": [
+                    CodeCandidate(
+                        code="E11.65",
+                        description="Type 2 diabetes mellitus with hyperglycemia",
+                    ),
+                    CodeCandidate(
+                        code="E11.9",
+                        description="Type 2 diabetes mellitus without complications",
+                    ),
+                ],
+                "hypertension": [
+                    CodeCandidate(code="I15.0", description="Renovascular hypertension"),
+                    CodeCandidate(
+                        code="I10",
+                        description="Essential (primary) hypertension",
+                    ),
+                ],
+            }
+        )
+        rxnorm = FakeRxNormClient(
+            by_phrase={
+                "metformin": [CodeCandidate(code="6809", description="metformin")],
+                "lisinopril": [CodeCandidate(code="29046", description="lisinopril")],
+            }
+        )
+        results = map_encounter(
+            encounter,
+            icd10_client=icd10,
+            rxnorm_client=rxnorm,
+        )
+        by_phrase = {item.source_phrase: item for item in results}
+        self.assertEqual(len(results), 4)
+        self.assertEqual(by_phrase["type 2 diabetes mellitus"].suggested_code, "E11.9")
+        self.assertEqual(by_phrase["hypertension"].suggested_code, "I10")
+        self.assertEqual(by_phrase["hypertension"].inference_source, "listed_phrase")
+        self.assertEqual(by_phrase["metformin"].suggested_code, "6809")
+        self.assertEqual(by_phrase["lisinopril"].suggested_code, "29046")
+        self.assertEqual(
+            icd10.phrases,
+            ["type 2 diabetes mellitus", "hypertension"],
+        )
+        self.assertEqual(rxnorm.phrases, ["metformin", "lisinopril"])
+
+    def test_syn008_codes_diabetes_and_skips_denied_chest_pain(self) -> None:
+        encounter = EncounterInput(
+            encounter_id="SYN-008",
+            note=(
+                "SYNTHETIC TEST NOTE: Adult presents with type 2 diabetes mellitus. "
+                "Denies chest pain. Continues metformin. "
+                "No real patient identifiers are included."
+            ),
+            diagnoses=[
+                PhraseInput(phrase="type 2 diabetes mellitus"),
+                PhraseInput(phrase="chest pain"),
+            ],
+            medications=[PhraseInput(phrase="metformin")],
+        )
+        icd10 = FakeIcd10Client(
+            by_phrase={
+                "type 2 diabetes mellitus": [
+                    CodeCandidate(
+                        code="E11.9",
+                        description="Type 2 diabetes mellitus without complications",
+                    )
+                ],
+                "chest pain": [
+                    CodeCandidate(code="R07.9", description="Chest pain, unspecified")
+                ],
+            }
+        )
+        results = map_encounter(
+            encounter,
+            icd10_client=icd10,
+            rxnorm_client=FakeRxNormClient(
+                candidates=[CodeCandidate(code="6809", description="metformin")]
+            ),
+        )
+        by_phrase = {item.source_phrase: item for item in results}
+        self.assertEqual(by_phrase["type 2 diabetes mellitus"].suggested_code, "E11.9")
+        self.assertEqual(by_phrase["type 2 diabetes mellitus"].clinical_context, "current")
+        self.assertEqual(by_phrase["chest pain"].review_status, "do_not_code")
+        self.assertEqual(by_phrase["chest pain"].clinical_context, "negated")
+        self.assertIsNone(by_phrase["chest pain"].suggested_code)
+        self.assertEqual(by_phrase["chest pain"].alternatives, [])
+        self.assertEqual(by_phrase["metformin"].suggested_code, "6809")
+        self.assertEqual(icd10.phrases, ["type 2 diabetes mellitus"])
+        self.assertNotIn("chest pain", icd10.phrases)
+
+    def test_syn009_prefers_hyperglycemia_code_when_note_states_it(self) -> None:
+        encounter = EncounterInput(
+            encounter_id="SYN-009",
+            note=(
+                "SYNTHETIC TEST NOTE: Adult presents with type 2 diabetes mellitus "
+                "with hyperglycemia. Started metformin 500 mg daily. "
+                "No real patient identifiers are included."
+            ),
+            diagnoses=[PhraseInput(phrase="type 2 diabetes mellitus with hyperglycemia")],
+            medications=[PhraseInput(phrase="metformin")],
+        )
+        icd10 = FakeIcd10Client(
+            by_phrase={
+                "type 2 diabetes mellitus with hyperglycemia": [
+                    CodeCandidate(
+                        code="E11.9",
+                        description="Type 2 diabetes mellitus without complications",
+                    ),
+                    CodeCandidate(
+                        code="E11.65",
+                        description="Type 2 diabetes mellitus with hyperglycemia",
+                    ),
+                ]
+            }
+        )
+        results = map_encounter(
+            encounter,
+            icd10_client=icd10,
+            rxnorm_client=FakeRxNormClient(
+                candidates=[CodeCandidate(code="6809", description="metformin")]
+            ),
+        )
+        by_phrase = {item.source_phrase: item for item in results}
+        self.assertEqual(
+            by_phrase["type 2 diabetes mellitus with hyperglycemia"].suggested_code,
+            "E11.65",
+        )
+        self.assertEqual(
+            by_phrase["type 2 diabetes mellitus with hyperglycemia"].review_status,
+            "needs_review",
+        )
+        self.assertEqual(by_phrase["metformin"].suggested_code, "6809")
+        self.assertEqual(
+            icd10.phrases,
+            ["type 2 diabetes mellitus with hyperglycemia"],
+        )
+
+    def test_syn010_keeps_historical_mi_and_current_diabetes_separate(self) -> None:
+        encounter = EncounterInput(
+            encounter_id="SYN-010",
+            note=(
+                "SYNTHETIC TEST NOTE: Adult has a history of myocardial infarction. "
+                "Currently presents with type 2 diabetes mellitus. "
+                "Continues aspirin and metformin. "
+                "No real patient identifiers are included."
+            ),
+            diagnoses=[
+                PhraseInput(phrase="myocardial infarction"),
+                PhraseInput(phrase="type 2 diabetes mellitus"),
+            ],
+            medications=[
+                PhraseInput(phrase="aspirin"),
+                PhraseInput(phrase="metformin"),
+            ],
+        )
+        icd10 = FakeIcd10Client(
+            by_phrase={
+                "myocardial infarction": [
+                    CodeCandidate(
+                        code="I21.9",
+                        description="Acute myocardial infarction, unspecified",
+                    ),
+                    CodeCandidate(
+                        code="I25.2",
+                        description="Old myocardial infarction",
+                    ),
+                ],
+                "type 2 diabetes mellitus": [
+                    CodeCandidate(
+                        code="E11.65",
+                        description="Type 2 diabetes mellitus with hyperglycemia",
+                    ),
+                    CodeCandidate(
+                        code="E11.9",
+                        description="Type 2 diabetes mellitus without complications",
+                    ),
+                ],
+            }
+        )
+        rxnorm = FakeRxNormClient(
+            by_phrase={
+                "aspirin": [CodeCandidate(code="1191", description="aspirin")],
+                "metformin": [CodeCandidate(code="6809", description="metformin")],
+            }
+        )
+        results = map_encounter(
+            encounter,
+            icd10_client=icd10,
+            rxnorm_client=rxnorm,
+        )
+        by_phrase = {item.source_phrase: item for item in results}
+        self.assertEqual(len(results), 4)
+        self.assertEqual(by_phrase["myocardial infarction"].clinical_context, "historical")
+        self.assertEqual(by_phrase["myocardial infarction"].suggested_code, "I25.2")
+        self.assertEqual(by_phrase["type 2 diabetes mellitus"].clinical_context, "current")
+        self.assertEqual(by_phrase["type 2 diabetes mellitus"].suggested_code, "E11.9")
+        self.assertEqual(by_phrase["aspirin"].suggested_code, "1191")
+        self.assertEqual(by_phrase["metformin"].suggested_code, "6809")
 
 
 if __name__ == "__main__":
