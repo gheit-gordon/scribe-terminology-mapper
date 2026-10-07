@@ -20,7 +20,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
-EntityType = Literal["diagnosis", "medication"]
+EntityType = Literal["diagnosis", "symptom", "medication"]
 CodeSystem = Literal["ICD-10-CM", "RxNorm"]
 ClinicalContext = Literal["current", "negated", "historical", "uncertain", "follow_up"]
 ReviewStatus = Literal["needs_review", "do_not_code", "no_code_found", "api_error"]
@@ -47,6 +47,7 @@ class EncounterInput:
     encounter_id: str
     note: str
     diagnoses: list[PhraseInput] = field(default_factory=list)
+    symptoms: list[PhraseInput] = field(default_factory=list)
     medications: list[PhraseInput] = field(default_factory=list)
 
 
@@ -99,6 +100,13 @@ def encounter_from_dict(raw: dict[str, Any]) -> EncounterInput:
         )
         for item in raw.get("diagnoses", [])
     ]
+    symptoms = [
+        PhraseInput(
+            phrase=str(item.get("phrase", "")).strip(),
+            clinical_context=item.get("clinical_context", "current"),
+        )
+        for item in raw.get("symptoms", [])
+    ]
     medications = [
         PhraseInput(
             phrase=str(item.get("phrase", "")).strip(),
@@ -110,5 +118,6 @@ def encounter_from_dict(raw: dict[str, Any]) -> EncounterInput:
         encounter_id=str(raw.get("encounter_id", "")).strip(),
         note=str(raw.get("note", "")).strip(),
         diagnoses=diagnoses,
+        symptoms=symptoms,
         medications=medications,
     )

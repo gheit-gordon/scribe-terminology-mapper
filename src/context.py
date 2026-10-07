@@ -136,8 +136,11 @@ def diagnosis_query_for_reason(reason: str) -> str:
 
 
 def _split_sentences(note: str) -> list[str]:
-    parts = re.split(r"(?<=[.!?])\s+", note.strip())
-    return [part.strip() for part in parts if part.strip()]
+    sentences: list[str] = []
+    for line in re.split(r"[\n\r]+", note.strip()):
+        parts = re.split(r"(?<=[.!?])\s+", line.strip())
+        sentences.extend(part.strip() for part in parts if part.strip())
+    return sentences
 
 
 def _has_cue_near_phrase(

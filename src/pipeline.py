@@ -1,7 +1,7 @@
 """Orchestrate phrase lookup without inventing medical codes.
 
 Version 2 still does not use an LLM. A caller (or the synthetic JSON
-file) supplies diagnosis and medication phrases. The pipeline then:
+file) supplies diagnosis, symptom, and medication phrases. The pipeline then:
 
 1. Detects negated / historical / uncertain / follow-up context from the note.
 2. Searches official terminology APIs only for findings that may be coded.
@@ -106,6 +106,20 @@ def map_encounter(
             )
         )
 
+    for phrase in encounter.symptoms:
+        context = detect_clinical_context(encounter.note, phrase.phrase)
+        results.append(
+            _map_phrase(
+                encounter=encounter,
+                phrase=phrase,
+                entity_type="symptom",
+                code_system="ICD-10-CM",
+                search=_symptom_search(icd10_client.search, phrase.phrase),
+                api_error_type=Icd10ApiError,
+                clinical_context=context,
+            )
+        )
+
     for phrase in encounter.medications:
         context = detect_clinical_context(encounter.note, phrase.phrase)
         results.append(
@@ -157,6 +171,33 @@ def _diagnosis_from_medication_reason(
         clinical_context="current",
         inference_source="medication_reason",
     )
+
+
+def _symptom_search(search: SearchFn, phrase: str) -> SearchFn:
+    """Search the symptom phrase, then the same phrase without a leading qualifier.
+
+    NLM's ICD-10-CM search does not match "dry cough" or "mild fever", but it
+    does match "cough" and "fever". The displayed phrase stays unchanged.
+    """
+
+    def search_symptom(query: str) -> list[CodeCandidate]:
+        candidates = search(query)
+        if candidates:
+            return candidates
+        broader = _broader_symptom_query(phrase)
+        if not broader or broader == query.strip().lower():
+            return []
+        return search(broader)
+
+    return search_symptom
+
+
+def _broader_symptom_query(phrase: str) -> str:
+    lowered = phrase.strip().lower()
+    for prefix in ("mild ", "dry ", "slight "):
+        if lowered.startswith(prefix):
+            return lowered[len(prefix) :].strip()
+    return ""
 
 
 def _map_phrase(
