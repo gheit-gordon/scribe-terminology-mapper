@@ -145,6 +145,16 @@ class Icd10HelperTests(unittest.TestCase):
         client = Icd10Client(get_json=fail_if_called)
         self.assertEqual(client.search("   "), [])
 
+    def test_client_requests_enough_hits_for_unspecified_codes(self) -> None:
+        seen: dict[str, str] = {}
+
+        def capture(url, params):
+            seen.update(params)
+            return [0, [], None, []]
+
+        Icd10Client(get_json=capture).search("meningitis")
+        self.assertGreaterEqual(int(seen["maxList"]), 50)
+
 
 class RxNormHelperTests(unittest.TestCase):
     def test_validates_numeric_rxcui(self) -> None:
@@ -226,6 +236,77 @@ class RankingTests(unittest.TestCase):
             clinical_context="current",
         )
         self.assertEqual(ranked[0].code, "I10")
+
+    def test_prefers_unspecified_meningitis_over_typhoid(self) -> None:
+        ranked = rank_candidates(
+            [
+                CodeCandidate(code="A01.01", description="Typhoid meningitis"),
+                CodeCandidate(code="G03.9", description="Meningitis, unspecified"),
+            ],
+            phrase="meningitis",
+            note="SYNTHETIC TEST NOTE: Adult presents with meningitis.",
+            clinical_context="current",
+        )
+        self.assertEqual(ranked[0].code, "G03.9")
+
+    def test_prefers_other_respiratory_novel_influenza_without_pneumonia(self) -> None:
+        ranked = rank_candidates(
+            [
+                CodeCandidate(
+                    code="J09.X1",
+                    description="Influenza due to identified novel influenza A virus with pneumonia",
+                ),
+                CodeCandidate(
+                    code="J09.X3",
+                    description="Influenza due to identified novel influenza A virus with gastrointestinal manifestations",
+                ),
+                CodeCandidate(
+                    code="J09.X9",
+                    description="Influenza due to identified novel influenza A virus with other manifestations",
+                ),
+                CodeCandidate(
+                    code="J09.X2",
+                    description="Influenza due to identified novel influenza A virus with other respiratory manifestations",
+                ),
+            ],
+            phrase="novel influenza",
+            note="SYNTHETIC TEST NOTE: Adult presents with avian flu.",
+            clinical_context="current",
+        )
+        self.assertEqual(ranked[0].code, "J09.X2")
+
+    def test_dry_eye_laterality_follows_the_phrase_sentence_only(self) -> None:
+        unspecified = CodeCandidate(
+            code="H04.129",
+            description="Dry eye syndrome of unspecified lacrimal gland",
+        )
+        right = CodeCandidate(
+            code="H04.121",
+            description="Dry eye syndrome of right lacrimal gland",
+        )
+        left = CodeCandidate(
+            code="H04.122",
+            description="Dry eye syndrome of left lacrimal gland",
+        )
+        bilateral = CodeCandidate(
+            code="H04.123",
+            description="Dry eye syndrome of bilateral lacrimal glands",
+        )
+        candidates = [right, left, bilateral, unspecified]
+        unrelated = rank_candidates(
+            candidates,
+            phrase="dry eye",
+            note="SYNTHETIC TEST NOTE: Wheezing at the right base. Adult has dry eye.",
+            clinical_context="current",
+        )
+        self.assertEqual(unrelated[0].code, "H04.129")
+        named = rank_candidates(
+            candidates,
+            phrase="dry eye",
+            note="SYNTHETIC TEST NOTE: Adult has right dry eye.",
+            clinical_context="current",
+        )
+        self.assertEqual(named[0].code, "H04.121")
 
 
 class ContextTests(unittest.TestCase):
@@ -511,6 +592,60 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(by_phrase["HCTZ"].suggested_code, "5487")
         self.assertNotIn("hypertension", by_phrase)
         self.assertEqual(len(results), 2)
+
+    def test_avian_and_swine_flu_search_novel_influenza(self) -> None:
+        novel = CodeCandidate(
+            code="J09.X2",
+            description="Influenza due to identified novel influenza A virus with other respiratory manifestations",
+        )
+        for phrase in ("avian flu", "swine flu"):
+            icd10 = FakeIcd10Client(by_phrase={"novel influenza": [novel]})
+            results = map_encounter(
+                EncounterInput(
+                    encounter_id="SYN-FLU",
+                    note=f"SYNTHETIC TEST NOTE: Adult presents with {phrase}.",
+                    diagnoses=[PhraseInput(phrase=phrase)],
+                ),
+                icd10_client=icd10,
+                rxnorm_client=FakeRxNormClient(),
+            )
+            self.assertEqual(icd10.phrases, ["novel influenza"])
+            self.assertEqual(results[0].source_phrase, phrase)
+            self.assertEqual(results[0].suggested_code, "J09.X2")
+
+    def test_lockjaw_searches_jaw_closure_unless_the_note_mentions_tetanus(self) -> None:
+        icd10 = FakeIcd10Client(
+            by_phrase={
+                "abnormal jaw closure": [CodeCandidate(code="M26.51", description="Abnormal jaw closure")],
+                "tetanus": [CodeCandidate(code="A35", description="Other tetanus")],
+            }
+        )
+        plain = map_encounter(
+            EncounterInput(
+                encounter_id="SYN-JAW",
+                note="SYNTHETIC TEST NOTE: Adult presents with lockjaw.",
+                diagnoses=[PhraseInput(phrase="lockjaw")],
+            ),
+            icd10_client=icd10,
+            rxnorm_client=FakeRxNormClient(),
+        )
+        self.assertEqual(icd10.phrases, ["abnormal jaw closure"])
+        self.assertEqual(plain[0].source_phrase, "lockjaw")
+        self.assertEqual(plain[0].suggested_code, "M26.51")
+
+        icd10.phrases.clear()
+        with_tetanus = map_encounter(
+            EncounterInput(
+                encounter_id="SYN-JAW",
+                note="SYNTHETIC TEST NOTE: Adult presents with lockjaw after tetanus.",
+                diagnoses=[PhraseInput(phrase="lockjaw")],
+            ),
+            icd10_client=icd10,
+            rxnorm_client=FakeRxNormClient(),
+        )
+        self.assertEqual(icd10.phrases, ["tetanus"])
+        self.assertEqual(with_tetanus[0].source_phrase, "lockjaw")
+        self.assertEqual(with_tetanus[0].suggested_code, "A35")
 
 
 if __name__ == "__main__":

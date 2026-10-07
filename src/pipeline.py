@@ -16,6 +16,7 @@ file) supplies diagnosis, symptom, and medication phrases. The pipeline then:
 from __future__ import annotations
 
 import os
+import re
 from typing import Any, Callable
 
 from src.context import (
@@ -37,6 +38,14 @@ from src.terminology.icd10 import Icd10Client, TerminologyApiError as Icd10ApiEr
 from src.terminology.rxnorm import RxNormClient, TerminologyApiError as RxNormApiError
 
 SearchFn = Callable[[str], list[CodeCandidate]]
+
+_ICD10_QUERY_ALIASES = {
+    "avian flu": "novel influenza",
+    "avian influenza": "novel influenza",
+    "bird flu": "novel influenza",
+    "swine flu": "novel influenza",
+    "swine influenza": "novel influenza",
+}
 
 
 def load_settings_from_env() -> dict[str, Any]:
@@ -173,6 +182,17 @@ def _diagnosis_from_medication_reason(
     )
 
 
+def _icd10_search_query(phrase: str, note: str) -> str:
+    """Return the NLM search text for a phrase the index does not contain."""
+
+    key = phrase.strip().lower()
+    if key == "lockjaw":
+        if re.search(r"\btetanus\b", note, re.IGNORECASE):
+            return "tetanus"
+        return "abnormal jaw closure"
+    return _ICD10_QUERY_ALIASES.get(key, phrase.strip())
+
+
 def _symptom_search(search: SearchFn, phrase: str) -> SearchFn:
     """Search the symptom phrase, then the same phrase without a leading qualifier.
 
@@ -240,8 +260,11 @@ def _map_phrase(
             inference_source=inference_source,
         )
 
+    query = phrase.phrase
+    if code_system == "ICD-10-CM":
+        query = _icd10_search_query(phrase.phrase, encounter.note)
     try:
-        candidates = search(phrase.phrase)
+        candidates = search(query)
     except api_error_type as exc:
         return _result(
             encounter,
@@ -270,7 +293,7 @@ def _map_phrase(
             inference_source=inference_source,
         )
 
-    ranked = rank_candidates(candidates, phrase.phrase, encounter.note, clinical_context)
+    ranked = rank_candidates(candidates, query, encounter.note, clinical_context)
     suggested, *alternatives = ranked
     return _result(
         encounter,
