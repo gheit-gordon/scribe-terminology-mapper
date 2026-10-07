@@ -29,7 +29,7 @@ from src.schemas import CodeCandidate
 
 DEFAULT_ICD10_URL = "https://clinicaltables.nlm.nih.gov/api/icd10cm/v3/search"
 DEFAULT_TIMEOUT_SECONDS = 10.0
-DEFAULT_MAX_CANDIDATES = 20
+DEFAULT_MAX_CANDIDATES = 50
 USER_AGENT = "ClinicalTerminologyMapper/0.1 (synthetic-educational-prototype)"
 
 # ICD-10-CM examples: E11.9, J44.9, T58.11XA

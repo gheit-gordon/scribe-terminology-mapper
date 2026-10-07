@@ -4,13 +4,9 @@ NLM search order is not a coding decision. This module only reorders codes
 the APIs already returned. It never invents a code.
 
 Rules (simple, no LLM):
-- Drop ICD candidates that need pregnancy, delivery, neonatal, stoma, or
-  (when current) personal-history context the note does not state.
 - Prefer generic labels (unspecified, without complications) when the note
   does not mention extra detail.
 - Downrank "with hyperglycemia"-style extras that are not in the note.
-- Boost the same extras when the note or phrase does state them, so a
-  supported specific code can beat a generic unspecified hit.
 - If the finding is historical, prefer old/history labels over acute ones.
 """
 
@@ -18,6 +14,7 @@ from __future__ import annotations
 
 import re
 
+from src.context import sentence_for_phrase
 from src.schemas import ClinicalContext, CodeCandidate
 
 GENERIC_PHRASES = (
@@ -55,63 +52,8 @@ GENERIC_TOKENS = {
 HISTORICAL_DESC = ("old ", "old,", "history", "chronic", "sequela", "healed")
 ACUTE_DESC = ("acute",)
 STOPWORDS = {"the", "of", "a", "an", "and", "or", "to", "in", "for", "with"}
-
-# Description cues that need matching support in the note. Groups are
-# independent: "pregnant" does not unlock a "following delivery" code.
-CONTEXT_QUALIFIER_GROUPS = (
-    ("pregnancy", "pregnant", "trimester"),
-    ("delivery", "postpartum", "puerperium"),
-    ("abortion", "termination", "ectopic", "molar pregnancy"),
-    ("neonatal", "newborn"),
-    ("stoma",),
-)
-HISTORY_CUES = ("personal history", "history of")
-
-
-def filter_context_compatible_candidates(
-    candidates: list[CodeCandidate],
-    supporting_text: str,
-    clinical_context: ClinicalContext,
-) -> list[CodeCandidate]:
-    """Keep only ICD candidates whose extra context is stated in the note."""
-
-    return [
-        candidate
-        for candidate in candidates
-        if _is_context_compatible(candidate, supporting_text, clinical_context)
-    ]
-
-
-def _is_context_compatible(
-    candidate: CodeCandidate,
-    supporting_text: str,
-    clinical_context: ClinicalContext,
-) -> bool:
-    description = candidate.description
-    for cues in CONTEXT_QUALIFIER_GROUPS:
-        if _text_has_any_cue(description, cues) and not _text_has_any_cue(
-            supporting_text, cues
-        ):
-            return False
-    if clinical_context != "historical":
-        if _text_has_any_cue(description, HISTORY_CUES) and not _text_has_any_cue(
-            supporting_text, HISTORY_CUES
-        ):
-            return False
-    return True
-
-
-def _text_has_any_cue(text: str, cues: tuple[str, ...]) -> bool:
-    for cue in cues:
-        if _text_has_cue(text, cue):
-            return True
-    return False
-
-
-def _text_has_cue(text: str, cue: str) -> bool:
-    if " " in cue:
-        return cue.lower() in text.lower()
-    return bool(re.search(rf"\b{re.escape(cue)}\b", text, re.IGNORECASE))
+LATERALITY = {"right", "left", "bilateral"}
+SPECIFIC_MANIFESTATIONS = ("pneumonia", "gastrointestinal", "encephalopathy", "myocarditis", "otitis")
 
 
 def rank_candidates(
@@ -155,13 +97,8 @@ def _score_candidate(
 
     for extra in re.finditer(r"\bwith\s+([a-z0-9]+(?:\s+[a-z0-9]+){0,3})", description):
         extra_text = extra.group(1).strip()
-        if not extra_text:
-            continue
-        if extra_text not in haystack:
+        if extra_text and extra_text not in haystack:
             score -= 6
-        else:
-            # Beat the generic +5 so documented specificity can win.
-            score += 8
 
     phrase_tokens = _content_tokens(phrase)
     description_tokens = _content_tokens(description)
@@ -169,10 +106,31 @@ def _score_candidate(
         overlap = len(phrase_tokens & description_tokens) / len(phrase_tokens)
         score += 6 * overlap
 
-    extra_tokens = description_tokens - phrase_tokens - GENERIC_TOKENS - _content_tokens(note)
+    sentence = sentence_for_phrase(note, phrase)
+    sentence_tokens = _content_tokens(sentence)
+    sentence_text = sentence.lower()
+    named_laterality = sentence_tokens & LATERALITY
+    forgiven = (_content_tokens(note) - LATERALITY) | named_laterality
+    extra_tokens = description_tokens - phrase_tokens - GENERIC_TOKENS - forgiven
     # Extra adjectives (renovascular, resistant, pulmonary) lose to a generic
     # match like essential / unspecified when those words are not in the note.
     score -= 4 * len(extra_tokens)
+
+    if named_laterality:
+        if "unspecified" in description_tokens:
+            score -= 8
+        if named_laterality & description_tokens:
+            score += 8
+
+    named_manifestation = any(
+        manifestation in sentence_text or manifestation in phrase.lower()
+        for manifestation in SPECIFIC_MANIFESTATIONS
+    )
+    for manifestation in SPECIFIC_MANIFESTATIONS:
+        if manifestation in description and not named_manifestation:
+            score -= 8
+    if not named_manifestation and "other respiratory" in description:
+        score += 8
     return score
 
 

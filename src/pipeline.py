@@ -1,32 +1,30 @@
 """Orchestrate phrase lookup without inventing medical codes.
 
 Version 2 still does not use an LLM. A caller (or the synthetic JSON
-file) supplies diagnosis and medication phrases. The pipeline then:
+file) supplies diagnosis, symptom, and medication phrases. The pipeline then:
 
 1. Detects negated / historical / uncertain / follow-up context from the note.
 2. Searches official terminology APIs only for findings that may be coded.
-3. Expands known diagnosis abbreviations for ICD-10 search only (not RxNorm).
-4. Drops ICD candidates that need unsupported context, then ranks the rest.
-5. Ranks validated candidates (generic unless the note is specific).
-6. Does not suggest negated, unconfirmed, or follow-up diseases as codes
+3. Ranks validated candidates (generic unless the note is specific).
+4. Does not suggest negated, unconfirmed, or follow-up diseases as codes
    and does not attach API candidates for those rows.
-7. If a listed med is written as '{drug} for {reason}', also searches
+5. If a listed med is written as '{drug} for {reason}', also searches
    that stated reason as a diagnosis.
-8. Leaves confidence as null.
+6. Leaves confidence as null.
 """
 
 from __future__ import annotations
 
 import os
+import re
 from typing import Any, Callable
 
-from src.abbreviations import expand_abbreviations
 from src.context import (
     detect_clinical_context,
     diagnosis_query_for_reason,
     extract_medication_reason,
 )
-from src.ranking import filter_context_compatible_candidates, rank_candidates
+from src.ranking import rank_candidates
 from src.schemas import (
     ClinicalContext,
     CodeCandidate,
@@ -40,6 +38,14 @@ from src.terminology.icd10 import Icd10Client, TerminologyApiError as Icd10ApiEr
 from src.terminology.rxnorm import RxNormClient, TerminologyApiError as RxNormApiError
 
 SearchFn = Callable[[str], list[CodeCandidate]]
+
+_ICD10_QUERY_ALIASES = {
+    "avian flu": "novel influenza",
+    "avian influenza": "novel influenza",
+    "bird flu": "novel influenza",
+    "swine flu": "novel influenza",
+    "swine influenza": "novel influenza",
+}
 
 
 def load_settings_from_env() -> dict[str, Any]:
@@ -106,7 +112,20 @@ def map_encounter(
                 search=icd10_client.search,
                 api_error_type=Icd10ApiError,
                 clinical_context=context,
-                normalize_query=True,
+            )
+        )
+
+    for phrase in encounter.symptoms:
+        context = detect_clinical_context(encounter.note, phrase.phrase)
+        results.append(
+            _map_phrase(
+                encounter=encounter,
+                phrase=phrase,
+                entity_type="symptom",
+                code_system="ICD-10-CM",
+                search=_symptom_search(icd10_client.search, phrase.phrase),
+                api_error_type=Icd10ApiError,
+                clinical_context=context,
             )
         )
 
@@ -121,7 +140,6 @@ def map_encounter(
                 search=rxnorm_client.search,
                 api_error_type=RxNormApiError,
                 clinical_context=context,
-                normalize_query=False,
             )
         )
         extra = _diagnosis_from_medication_reason(
@@ -161,8 +179,45 @@ def _diagnosis_from_medication_reason(
         api_error_type=Icd10ApiError,
         clinical_context="current",
         inference_source="medication_reason",
-        normalize_query=True,
     )
+
+
+def _icd10_search_query(phrase: str, note: str) -> str:
+    """Return the NLM search text for a phrase the index does not contain."""
+
+    key = phrase.strip().lower()
+    if key == "lockjaw":
+        if re.search(r"\btetanus\b", note, re.IGNORECASE):
+            return "tetanus"
+        return "abnormal jaw closure"
+    return _ICD10_QUERY_ALIASES.get(key, phrase.strip())
+
+
+def _symptom_search(search: SearchFn, phrase: str) -> SearchFn:
+    """Search the symptom phrase, then the same phrase without a leading qualifier.
+
+    NLM's ICD-10-CM search does not match "dry cough" or "mild fever", but it
+    does match "cough" and "fever". The displayed phrase stays unchanged.
+    """
+
+    def search_symptom(query: str) -> list[CodeCandidate]:
+        candidates = search(query)
+        if candidates:
+            return candidates
+        broader = _broader_symptom_query(phrase)
+        if not broader or broader == query.strip().lower():
+            return []
+        return search(broader)
+
+    return search_symptom
+
+
+def _broader_symptom_query(phrase: str) -> str:
+    lowered = phrase.strip().lower()
+    for prefix in ("mild ", "dry ", "slight "):
+        if lowered.startswith(prefix):
+            return lowered[len(prefix) :].strip()
+    return ""
 
 
 def _map_phrase(
@@ -174,7 +229,6 @@ def _map_phrase(
     api_error_type: type[Exception],
     clinical_context: ClinicalContext,
     inference_source: InferenceSource = "listed_phrase",
-    normalize_query: bool = False,
 ) -> MappingResult:
     if not phrase.phrase:
         return _result(
@@ -206,8 +260,9 @@ def _map_phrase(
             inference_source=inference_source,
         )
 
-    query = expand_abbreviations(phrase.phrase) if normalize_query else phrase.phrase
-
+    query = phrase.phrase
+    if code_system == "ICD-10-CM":
+        query = _icd10_search_query(phrase.phrase, encounter.note)
     try:
         candidates = search(query)
     except api_error_type as exc:
@@ -237,26 +292,6 @@ def _map_phrase(
             clinical_context=clinical_context,
             inference_source=inference_source,
         )
-
-    if code_system == "ICD-10-CM":
-        candidates = filter_context_compatible_candidates(
-            candidates,
-            encounter.note,
-            clinical_context,
-        )
-        if not candidates:
-            return _result(
-                encounter,
-                phrase,
-                entity_type,
-                code_system,
-                suggested=None,
-                alternatives=[],
-                review_status="no_code_found",
-                error_message="No context-compatible ICD-10-CM candidate was found.",
-                clinical_context=clinical_context,
-                inference_source=inference_source,
-            )
 
     ranked = rank_candidates(candidates, query, encounter.note, clinical_context)
     suggested, *alternatives = ranked
